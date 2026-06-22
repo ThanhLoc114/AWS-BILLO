@@ -1,0 +1,5 @@
+{
+  "API_BASE_URL": "https://zsqkp5vpb9.execute-api.ap-southeast-1.amazonaws.com/dev",
+  "AWS_REGION": "ap-southeast-1",
+  "COGNITO_CLIENT_ID": "1cj39vsl5tuoa7g7pk304hakm4"
+}

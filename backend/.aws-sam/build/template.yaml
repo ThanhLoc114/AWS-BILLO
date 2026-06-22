@@ -1,0 +1,696 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Wallet App AWS-only backend (SAM)
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 15
+    MemorySize: 256
+    Architectures:
+    - x86_64
+    Environment:
+      Variables:
+        MAIN_TABLE_NAME:
+          Ref: MainTable
+        IDEMPOTENCY_TABLE_NAME:
+          Ref: IdempotencyTable
+        UPLOAD_BUCKET_NAME:
+          Ref: UploadBucket
+        PAYMENT_SESSION_TTL_SECONDS: '300'
+        LOG_LEVEL: INFO
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+    AllowedValues:
+    - dev
+    - staging
+    - prod
+Resources:
+  CognitoSmsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: wallet-app-cognito-sms-${StageName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: cognito-idp.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              sts:ExternalId:
+                Fn::Sub: wallet-app-${StageName}
+      Policies:
+      - PolicyName: PublishCognitoSms
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: '*'
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName:
+        Fn::Sub: wallet-app-${StageName}
+      UsernameAttributes:
+      - phone_number
+      AutoVerifiedAttributes:
+      - phone_number
+      SmsConfiguration:
+        ExternalId:
+          Fn::Sub: wallet-app-${StageName}
+        SnsCallerArn:
+          Fn::GetAtt:
+          - CognitoSmsRole
+          - Arn
+        SnsRegion:
+          Ref: AWS::Region
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+        - Name: verified_phone_number
+          Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+        - phone_number
+      DeletionProtection:
+        Fn::If:
+        - IsProd
+        - ACTIVE
+        - INACTIVE
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName:
+        Fn::Sub: wallet-app-mobile-${StageName}
+      UserPoolId:
+        Ref: UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      ExplicitAuthFlows:
+      - ALLOW_USER_SRP_AUTH
+      - ALLOW_USER_PASSWORD_AUTH
+      - ALLOW_REFRESH_TOKEN_AUTH
+      ReadAttributes:
+      - phone_number
+      - phone_number_verified
+  CustomerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: customer
+      Description: Wallet customers
+      Precedence: 30
+      UserPoolId:
+        Ref: UserPool
+  MerchantGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: merchant
+      Description: Approved merchants
+      Precedence: 20
+      UserPoolId:
+        Ref: UserPool
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      Description: Wallet administrators
+      Precedence: 10
+      UserPoolId:
+        Ref: UserPool
+  CommonDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName:
+        Fn::Sub: wallet-app-common-dependencies-${StageName}
+      Description: Shared Node.js dependencies for wallet backend Lambdas
+      ContentUri: ..\..\layers\common
+      CompatibleRuntimes:
+      - nodejs22.x
+      RetentionPolicy: Retain
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName:
+        Ref: StageName
+      CorsConfiguration:
+        AllowHeaders:
+        - Authorization
+        - Content-Type
+        - Idempotency-Key
+        AllowMethods:
+        - GET
+        - POST
+        - PATCH
+        - DELETE
+        - OPTIONS
+        AllowOrigins:
+        - '*'
+      Auth:
+        Authorizers:
+          CognitoJwtAuthorizer:
+            JwtConfiguration:
+              issuer:
+                Fn::GetAtt:
+                - UserPool
+                - ProviderURL
+              audience:
+              - Ref: UserPoolClient
+            IdentitySource: $request.header.Authorization
+        DefaultAuthorizer: CognitoJwtAuthorizer
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+        - AllowedHeaders:
+          - '*'
+          AllowedMethods:
+          - PUT
+          - GET
+          - HEAD
+          AllowedOrigins:
+          - '*'
+          MaxAge: 300
+  MainTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: wallet-app-main-${StageName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: PK
+        AttributeType: S
+      - AttributeName: SK
+        AttributeType: S
+      - AttributeName: GSI1PK
+        AttributeType: S
+      - AttributeName: GSI1SK
+        AttributeType: S
+      KeySchema:
+      - AttributeName: PK
+        KeyType: HASH
+      - AttributeName: SK
+        KeyType: RANGE
+      GlobalSecondaryIndexes:
+      - IndexName: GSI1
+        KeySchema:
+        - AttributeName: GSI1PK
+          KeyType: HASH
+        - AttributeName: GSI1SK
+          KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: wallet-app-idempotency-${StageName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: IdempotencyKey
+        AttributeType: S
+      KeySchema:
+      - AttributeName: IdempotencyKey
+        KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  SharedFunctionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName:
+        Fn::Sub: wallet-app-shared-lambda-policy-${StageName}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: DynamoMainAccess
+          Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:BatchGetItem
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+          - dynamodb:DeleteItem
+          - dynamodb:Query
+          - dynamodb:TransactWriteItems
+          - dynamodb:ConditionCheckItem
+          Resource:
+          - Fn::GetAtt:
+            - MainTable
+            - Arn
+          - Fn::Sub: ${MainTable.Arn}/index/*
+        - Sid: DynamoIdempotencyAccess
+          Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+          - dynamodb:DeleteItem
+          Resource:
+          - Fn::GetAtt:
+            - IdempotencyTable
+            - Arn
+        - Sid: S3UploadAccess
+          Effect: Allow
+          Action:
+          - s3:PutObject
+          - s3:GetObject
+          Resource:
+          - Fn::Sub: ${UploadBucket.Arn}/*
+        - Sid: CognitoGroupManagement
+          Effect: Allow
+          Action:
+          - cognito-idp:AdminAddUserToGroup
+          - cognito-idp:AdminRemoveUserFromGroup
+          Resource:
+          - Fn::GetAtt:
+            - UserPool
+            - Arn
+  AuthProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: AuthProfileFunction
+      Handler: functions/auth_profile/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        GetProfile:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /me/profile
+            Method: GET
+        PatchProfile:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /me/profile
+            Method: PATCH
+        CreateProfile:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /me/profile
+            Method: POST
+    Metadata:
+      SamResourceId: AuthProfileFunction
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: PostConfirmationFunction
+      Handler: functions/post_confirmation/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: MainTable
+      Events:
+        CognitoPostConfirmation:
+          Type: Cognito
+          Properties:
+            UserPool:
+              Ref: UserPool
+            Trigger: PostConfirmation
+    Metadata:
+      SamResourceId: PostConfirmationFunction
+  MerchantApplicationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: MerchantApplicationFunction
+      Handler: functions/merchant_application/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        CreateApplication:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/applications
+            Method: POST
+        GetMyApplication:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/applications/me
+            Method: GET
+    Metadata:
+      SamResourceId: MerchantApplicationFunction
+  UploadPresignFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: UploadPresignFunction
+      Handler: functions/upload_presign/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        CreateUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /uploads/presign
+            Method: POST
+    Metadata:
+      SamResourceId: UploadPresignFunction
+  AdminApprovalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: AdminApprovalFunction
+      Handler: functions/admin_approval/index.handler
+      Environment:
+        Variables:
+          USER_POOL_ID:
+            Ref: UserPool
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        ListApplications:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /admin/merchant-applications
+            Method: GET
+        GetApplication:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /admin/merchant-applications/{applicationId}
+            Method: GET
+        ApproveApplication:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /admin/merchant-applications/{applicationId}/approve
+            Method: POST
+        RejectApplication:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /admin/merchant-applications/{applicationId}/reject
+            Method: POST
+    Metadata:
+      SamResourceId: AdminApprovalFunction
+  MerchantStoreProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: MerchantStoreProductFunction
+      Handler: functions/merchant_store_product/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        GetStore:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/store
+            Method: GET
+        PatchStore:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/store
+            Method: PATCH
+        CreateProduct:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/products
+            Method: POST
+        ListProducts:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/products
+            Method: GET
+        PatchProduct:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/products/{productId}
+            Method: PATCH
+        DeleteProduct:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/products/{productId}
+            Method: DELETE
+    Metadata:
+      SamResourceId: MerchantStoreProductFunction
+  MerchantOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: MerchantOrderFunction
+      Handler: functions/merchant_order/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        CreateOrder:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/orders
+            Method: POST
+        ListOrders:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/orders
+            Method: GET
+        GetOrder:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/orders/{orderId}
+            Method: GET
+        CheckoutCash:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/orders/{orderId}/checkout-cash
+            Method: POST
+        CheckoutQr:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/orders/{orderId}/checkout-qr
+            Method: POST
+        CancelOrder:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/orders/{orderId}/cancel
+            Method: POST
+        RefundOrder:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /merchant/orders/{orderId}/refund
+            Method: POST
+    Metadata:
+      SamResourceId: MerchantOrderFunction
+  PaymentSessionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: PaymentSessionFunction
+      Handler: functions/payment_session/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        GetPaymentSession:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /payments/sessions/{sessionId}
+            Method: GET
+        ConfirmTransfer:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /payments/sessions/{sessionId}/confirm-transfer
+            Method: POST
+    Metadata:
+      SamResourceId: PaymentSessionFunction
+  WalletTransferFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: WalletTransferFunction
+      Handler: functions/wallet_transfer/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        WalletTransfer:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /wallet/transfer
+            Method: POST
+        WalletBalance:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /wallet/balance
+            Method: GET
+        ResolveRecipient:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /wallet/recipients/resolve
+            Method: GET
+    Metadata:
+      SamResourceId: WalletTransferFunction
+  TransactionHistoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: TransactionHistoryFunction
+      Handler: functions/transaction_history/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        WalletTransactions:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /wallet/transactions
+            Method: GET
+        WalletTransactionDetail:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /wallet/transactions/{txId}
+            Method: GET
+    Metadata:
+      SamResourceId: TransactionHistoryFunction
+  DirectorySearchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: DirectorySearchFunction
+      Handler: functions/directory_search/index.handler
+      Layers:
+      - Ref: CommonDependenciesLayer
+      Policies:
+      - AWSLambdaBasicExecutionRole
+      - Ref: SharedFunctionPolicy
+      Events:
+        SearchDirectory:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: HttpApi
+            Path: /directory/search
+            Method: GET
+    Metadata:
+      SamResourceId: DirectorySearchFunction
+Outputs:
+  ApiBaseUrl:
+    Description: HTTP API endpoint
+    Value:
+      Fn::Sub: https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  MainTableName:
+    Value:
+      Ref: MainTable
+  IdempotencyTableName:
+    Value:
+      Ref: IdempotencyTable
+  UploadBucketName:
+    Value:
+      Ref: UploadBucket
+  UserPoolId:
+    Value:
+      Ref: UserPool
+  UserPoolClientId:
+    Value:
+      Ref: UserPoolClient
+Conditions:
+  IsProd:
+    Fn::Equals:
+    - Ref: StageName
+    - prod

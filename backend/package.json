@@ -1,0 +1,21 @@
+{
+  "name": "wallet-app-backend",
+  "version": "1.0.0",
+  "description": "AWS SAM backend for wallet app",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "seed:dev": "node scripts/seed-dev-wallets.js",
+    "seed:dev-customer": "node scripts/seed-dev-customer.js",
+    "sam:validate": "sam validate -t template.yaml",
+    "sam:build": "sam build -t template.yaml"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.699.0",
+    "@aws-sdk/client-dynamodb": "^3.699.0",
+    "@aws-sdk/client-s3": "^3.699.0",
+    "@aws-sdk/s3-request-presigner": "^3.699.0",
+    "@aws-sdk/lib-dynamodb": "^3.699.0"
+  }
+}
